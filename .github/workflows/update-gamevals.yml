@@ -1,0 +1,123 @@
+name: Update gamevals
+
+env:
+  MAIN_REPO: ${{ vars.MAIN_REPO || '117HD/RLHD' }}
+  GAMEVALS_PATH: ${{ vars.GAMEVALS_PATH || 'src/main/resources/rs117/hd/scene/gamevals.json' }}
+  GH_TOKEN: ${{ github.token }}
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual triggering
+
+jobs:
+  check-for-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      rev: ${{ steps.check.outputs.rev }}
+    steps:
+      - name: Check for RuneLite gameval changes
+        id: check
+        run: |
+          target_message="Update GameVals to "
+          result=$(gh search commits \
+            --repo runelite/runelite "$target_message" \
+            --json sha,commit \
+            --jq '.[0] | {sha: .sha, message: .commit.message}')
+          next_sha=$(echo $result | jq -r '.sha')
+          prev_sha="${{ vars.LAST_GAMEVAL_SHA || 'unknown' }}"
+
+          if [ "$prev_sha" = "$next_sha" ]; then
+            echo "Already up to date with $next_sha"
+          else
+            rev=$(echo $result | jq -r ".message | split(\"\n\")[0] | ltrimstr(\"$target_message\")")
+            echo "Found gameval changes: $rev ($prev_sha -> $next_sha)"
+            echo "sha=$next_sha" >> $GITHUB_OUTPUT
+            echo "rev=$rev" >> $GITHUB_OUTPUT
+          fi
+
+  update-gamevals:
+    needs: check-for-changes
+    if: needs.check-for-changes.outputs.sha != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: pip install requests==2.33.1
+
+      - name: Checkout updater repository
+        uses: actions/checkout@v6
+
+      - name: Generate new gamevals
+        run: python generate_gamevals.py ${{ needs.check-for-changes.outputs.sha }}
+
+      - name: Compare with current gamevals
+        id: compare-changes
+        run: |
+          # Clone only what's necessary to determine whether the gamevals have changed
+          git clone -b master --filter=blob:none --no-checkout --sparse "https://github.com/$MAIN_REPO.git" main-repo
+          cd main-repo
+          git sparse-checkout set --no-cone '**/*.json'
+          git checkout
+          master_sha=$(git rev-parse HEAD)
+
+          if git diff --no-index --quiet "$GAMEVALS_PATH" ../gamevals.json; then
+            echo "No changes required"
+          else
+            echo "master_sha=$master_sha" >> $GITHUB_OUTPUT
+            echo "Generating report"
+            python ../generate_change_report.py ../gamevals.json > ../change-report.md
+          fi
+
+      # Requires read & write access to actions variables, code and pull requests in $MAIN_REPO and the current repo
+      - name: Generate GitHub app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Submit pull request
+        if: steps.compare-changes.outputs.master_sha != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          master_sha=${{ steps.compare-changes.outputs.master_sha }}
+          message="Update gamevals to ${{ needs.check-for-changes.outputs.rev }}"
+          branch="gamevals-${{ needs.check-for-changes.outputs.rev }}"
+
+          # Configure git user
+          slug="${{ steps.app-token.outputs.app-slug }}"
+          user_id=$(gh api "/users/$slug[bot]" --jq .id)
+          git config --global user.name "$slug[bot]"
+          git config --global user.email \
+            "$user_id+$slug[bot]@users.noreply.github.com"
+
+          # Create a branch in the main repository
+          cd main-repo
+          git checkout -b "$branch"
+          cp ../gamevals.json "$GAMEVALS_PATH"
+          git add "$GAMEVALS_PATH"
+          git commit -m "$message"
+          git push "https://x-access-token:$GH_TOKEN@github.com/$MAIN_REPO.git" "$branch"
+
+          gh pr create \
+            --repo $MAIN_REPO \
+            --base master \
+            --head "$branch" \
+            --title "$message" \
+            --body-file ../change-report.md
+
+      - name: Mark RuneLite commit as complete
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh variable set LAST_GAMEVAL_SHA --body "${{ needs.check-for-changes.outputs.sha }}"
